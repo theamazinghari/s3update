@@ -1,9 +1,11 @@
 package s3update
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"runtime"
 	"strconv"
@@ -16,6 +18,9 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mitchellh/ioprogress"
 )
+
+var downloadSize int64
+var ErrInconsistentFileSize = errors.New("inconsistent file size")
 
 type Updater struct {
 	// CurrentVersion represents the current binary version.
@@ -89,12 +94,11 @@ func runAutoUpdate(u Updater) error {
 		return fmt.Errorf("invalid local version")
 	}
 
-	svc := s3.New(session.New(), &aws.Config{Region: aws.String(u.S3Region)})
+	svc := s3.New(session.Must(session.NewSession()), &aws.Config{Region: aws.String(u.S3Region)})
 	resp, err := svc.GetObject(&s3.GetObjectInput{Bucket: aws.String(u.S3Bucket), Key: aws.String(u.S3VersionKey)})
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
@@ -114,7 +118,7 @@ func runAutoUpdate(u Updater) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		downloadSize = *resp.ContentLength
 		progressR := &ioprogress.Reader{
 			Reader:       resp.Body,
 			Size:         *resp.ContentLength,
@@ -130,31 +134,40 @@ func runAutoUpdate(u Updater) error {
 			return err
 		}
 
-		// Move the old version to a backup path that we can recover from
-		// in case the upgrade fails
 		destBackup := dest + ".bak"
-		if _, err := os.Stat(dest); err == nil {
-			os.Rename(dest, destBackup)
-		}
 
-		// Use the same flags that ioutil.WriteFile uses
-		f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+		// Create a temp file
+		tempFile, err := ioutil.TempFile("", "tmp_download")
 		if err != nil {
-			os.Rename(destBackup, dest)
+			printError(err)
 			return err
 		}
-		defer f.Close()
+		tempFilePath := tempFile.Name()
 
-		fmt.Printf("s3update: downloading new version to %s\n", dest)
+		// Download to tempFile
+		// Use the same flags that ioutil.WriteFile uses
+		f, err := os.OpenFile(tempFile.Name(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+		if err != nil {
+			os.Remove(tempFile.Name())
+			return err
+		}
+		err = tempFile.Close()
+		printError(err)
+
+		fmt.Printf("s3update: downloading new version to %s\n", tempFile.Name())
 		if _, err := io.Copy(f, progressR); err != nil {
-			os.Rename(destBackup, dest)
+			printError(err)
 			return err
 		}
-		// The file must be closed already so we can execute it in the next step
-		f.Close()
+		// Close the response stream
+		err = resp.Body.Close()
+		printError(err)
+		// The file must be closed so we can execute it in the next step
+		err = f.Close()
+		printError(err)
 
-		// Removing backup
-		os.Remove(destBackup)
+		err = finalizeUpdate(dest, destBackup, tempFilePath)
+		printError(err)
 
 		fmt.Printf("s3update: updated with success to version %d\nRestarting application\n", remoteVersion)
 
@@ -165,6 +178,37 @@ func runAutoUpdate(u Updater) error {
 
 		os.Exit(0)
 	}
-
 	return nil
+}
+
+func printError(err error) {
+	if err != nil {
+		fmt.Println("s3Update: ", err)
+	}
+}
+
+func finalizeUpdate(originalFile, backupFile, tempFile string) (err error) {
+	if fileSize(tempFile) == downloadSize { // backup old binary then replace it with downloaded file
+		// Backup current binary
+		if _, err = os.Stat(originalFile); err == nil {
+			err = os.Rename(originalFile, backupFile)
+		}
+
+		// Replace old binary by downloaded file
+		if err = os.Rename(tempFile, originalFile); err != nil {
+			// revert backup file
+			err = os.Rename(backupFile, originalFile)
+		}
+	} else { // Do nothing
+		err = ErrInconsistentFileSize
+	}
+	return
+}
+
+func fileSize(path string) int64 {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return fileInfo.Size()
 }
