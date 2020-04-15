@@ -1,7 +1,6 @@
 package s3update
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,8 +18,7 @@ import (
 	"github.com/mitchellh/ioprogress"
 )
 
-var downloadSize int64
-var ErrInconsistentFileSize = errors.New("inconsistent file size")
+var remoteFileSize int64
 
 type Updater struct {
 	// CurrentVersion represents the current binary version.
@@ -118,7 +116,7 @@ func runAutoUpdate(u Updater) error {
 		if err != nil {
 			return err
 		}
-		downloadSize = *resp.ContentLength
+		remoteFileSize = *resp.ContentLength
 		progressR := &ioprogress.Reader{
 			Reader:       resp.Body,
 			Size:         *resp.ContentLength,
@@ -137,9 +135,8 @@ func runAutoUpdate(u Updater) error {
 		destBackup := dest + ".bak"
 
 		// Create a temp file
-		tempFile, err := ioutil.TempFile("", "tmp_download")
+		tempFile, err := ioutil.TempFile("", "s3update_tmp_download")
 		if err != nil {
-			printError(err)
 			return err
 		}
 		tempFilePath := tempFile.Name()
@@ -148,31 +145,37 @@ func runAutoUpdate(u Updater) error {
 		// Use the same flags that ioutil.WriteFile uses
 		f, err := os.OpenFile(tempFile.Name(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 		if err != nil {
-			os.Remove(tempFile.Name())
+			_ = os.Remove(tempFile.Name())
 			return err
 		}
-		err = tempFile.Close()
-		printError(err)
 
-		fmt.Printf("s3update: downloading new version to %s\n", tempFile.Name())
+		if err := tempFile.Close(); err != nil {
+			return err
+		}
+
 		if _, err := io.Copy(f, progressR); err != nil {
-			printError(err)
 			return err
 		}
-		// Close the response stream
-		err = resp.Body.Close()
-		printError(err)
-		// The file must be closed so we can execute it in the next step
-		err = f.Close()
-		printError(err)
 
-		err = finalizeUpdate(dest, destBackup, tempFilePath)
-		printError(err)
+		// Close the response stream
+		if err := resp.Body.Close(); err != nil {
+			return err
+		}
+
+		// The file must be closed so we can execute it in the next step
+		if err := f.Close(); err != nil {
+			return err
+		}
+
+		if err := finalizeUpdate(dest, destBackup, tempFilePath); err != nil {
+			return err
+		}
 
 		fmt.Printf("s3update: updated with success to version %d\nRestarting application\n", remoteVersion)
 
 		// The update completed, we can now restart the application without requiring any user action.
 		if err := syscall.Exec(dest, os.Args, os.Environ()); err != nil {
+			fmt.Println(err)
 			return err
 		}
 
@@ -181,28 +184,26 @@ func runAutoUpdate(u Updater) error {
 	return nil
 }
 
-func printError(err error) {
-	if err != nil {
-		fmt.Println("s3Update: ", err)
-	}
-}
-
-func finalizeUpdate(originalFile, backupFile, tempFile string) (err error) {
-	if fileSize(tempFile) == downloadSize { // backup old binary then replace it with downloaded file
+func finalizeUpdate(originalFilePath, backupFilePath, tempFilePath string) (err error) {
+	if downloadSucceeded(tempFilePath) {
 		// Backup current binary
-		if _, err = os.Stat(originalFile); err == nil {
-			err = os.Rename(originalFile, backupFile)
+		if _, err = os.Stat(originalFilePath); err == nil {
+			err = os.Rename(originalFilePath, backupFilePath)
 		}
 
 		// Replace old binary by downloaded file
-		if err = os.Rename(tempFile, originalFile); err != nil {
+		if err = os.Rename(tempFilePath, originalFilePath); err != nil {
 			// revert backup file
-			err = os.Rename(backupFile, originalFile)
+			err = os.Rename(backupFilePath, originalFilePath)
 		}
 	} else { // Do nothing
-		err = ErrInconsistentFileSize
+		return fmt.Errorf("inconsistent file size")
 	}
 	return
+}
+
+func downloadSucceeded(tempFile string) bool {
+	return fileSize(tempFile) == remoteFileSize
 }
 
 func fileSize(path string) int64 {
